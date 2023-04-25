@@ -35,7 +35,7 @@ static int test1(int fd, int is_verbose, const char *devpath, off_t test_area)
 	int err;
 
 	size = 4;
-	offset = 0xf0000010;
+	offset = 0xfcc00050;
 	ssize = pread(fd, buff, size, offset);
 	if (ssize < 0) {
 		err = errno;
@@ -112,8 +112,9 @@ static int test2(int fd, int is_verbose, const char *devpath, off_t test_area)
 
 	for (size = 0; size < TEST2_BUFFER_SIZE; size++) {
 		if (buff[0][size] != buff[1][size]) {
-			printf("Mismatch at offset %zu (read 0x%02"PRIx8", exp 0x%02"PRIx8")\n",
+			printf("Mismatch at offset %zu hard 0x%zx (read 0x%02"PRIx8", exp 0x%02"PRIx8")\n",
 				size,
+				size * 4 + offset,
 				buff[1][size],
 				buff[0][size]);
 			return EILSEQ;
@@ -127,18 +128,19 @@ static int test2(int fd, int is_verbose, const char *devpath, off_t test_area)
 
 static int test3(int fd, int is_verbose, const char *devpath, off_t test_area)
 {
-#define TEST3_BUFFER_SIZE (1*1024*1024/sizeof(uint32_t))
-	uint32_t buff[2][TEST3_BUFFER_SIZE];
+#define TEST3_BUFFER_SIZE (256*1024)
+#define TEST3_BUFFER_LENGTH (TEST3_BUFFER_SIZE/sizeof(uint32_t))
+	uint32_t buff[2][TEST3_BUFFER_LENGTH];
 	size_t size;
 	off_t offset;
 	ssize_t ssize;
 	int err;
 
-	for (size = 0; size < TEST3_BUFFER_SIZE; size++) {
+	for (size = 0; size < TEST3_BUFFER_LENGTH; size++) {
 		buff[0][size] = size;
 	}
 
-	size = TEST3_BUFFER_SIZE * sizeof(buff[0][0]);
+	size = TEST3_BUFFER_LENGTH * sizeof(buff[0][0]);
 	offset = test_area;
 	ssize = pwrite(fd, buff[0], size, offset);
 	if (ssize < 0) {
@@ -156,7 +158,7 @@ static int test3(int fd, int is_verbose, const char *devpath, off_t test_area)
 	if (is_verbose)
 		printf("Wr @0x%04lx, %zu\n", offset, size);
 
-	size = TEST3_BUFFER_SIZE * sizeof(buff[1][0]);
+	size = TEST3_BUFFER_LENGTH * sizeof(buff[1][0]);
 	offset = test_area;
 	ssize = pread(fd, buff[1], size, offset);
 	if (ssize < 0) {
@@ -174,10 +176,11 @@ static int test3(int fd, int is_verbose, const char *devpath, off_t test_area)
 	if (is_verbose)
 		printf("Rd @0x%04lx, %zu\n", offset, size);
 
-	for (size = 0; size < TEST3_BUFFER_SIZE; size++) {
+	for (size = 0; size < TEST3_BUFFER_LENGTH; size++) {
 		if (buff[0][size] != buff[1][size]) {
-			printf("Mismatch at offset %zu (read 0x%04"PRIx16", exp 0x%04"PRIx16")\n",
+			printf("Mismatch at offset %zu hard 0x%zx (read 0x%08"PRIx32", exp 0x%08"PRIx32")\n",
 				size,
+				size * 4 + offset,
 				buff[1][size],
 				buff[0][size]);
 			return EILSEQ;
@@ -283,7 +286,7 @@ static int test_multithread(int fd, int is_verbose, const char *devpath, off_t t
 	p[1].devpath = devpath;
 	p[1].fd = fd1;
 	p[1].is_verbose = is_verbose;
-	p[1].test_area = test_area + 1*1024*1024; /* Do not overlap with other thread */
+	p[1].test_area = test_area + 1 * TEST3_BUFFER_SIZE ; /* Do not overlap with other thread */
 	p[1].nb_loop = nb_loop;
 	p[1].is_verbose = is_verbose;
 	p[1].err = EINPROGRESS;
@@ -292,7 +295,7 @@ static int test_multithread(int fd, int is_verbose, const char *devpath, off_t t
 	p[2].devpath = devpath;
 	p[2].fd = fd2;
 	p[2].is_verbose = is_verbose;
-	p[2].test_area = test_area + 2*1024*1024; /* Do not overlap with other thread */
+	p[2].test_area = test_area + 2 * TEST3_BUFFER_SIZE; /* Do not overlap with other thread */
 	p[2].nb_loop = nb_loop;
 	p[2].is_verbose = is_verbose;
 	p[2].err = EINPROGRESS;
@@ -337,7 +340,7 @@ end:
 
 static int test4(int fd, int is_verbose, const char *devpath, off_t test_area)
 {
-	return test_multithread(fd, is_verbose, devpath, test_area, 10, 2);
+	return test_multithread(fd, 0, devpath, test_area, 10, 2);
 }
 
 static int test5(int fd, int is_verbose, const char *devpath, off_t test_area)
@@ -347,7 +350,7 @@ static int test5(int fd, int is_verbose, const char *devpath, off_t test_area)
 
 static int test6(int fd, int is_verbose, const char *devpath, off_t test_area)
 {
-	return test_multithread(fd, is_verbose, devpath, test_area, 10, 3);
+	return test_multithread(fd, 0, devpath, test_area, 10, 3);
 }
 
 static int test7(int fd, int is_verbose, const char *devpath, off_t test_area)
@@ -375,13 +378,12 @@ int main(int argc, char* argv[])
 	int err;
 	int ret;
 	int failed;
+	off_t test_area;
 
 	if (argc < 1)
 		devpath = "/dev/akida0";
 	else
 		devpath = argv[1];
-
-
 
 	fd = open(devpath, O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
@@ -391,12 +393,21 @@ int main(int argc, char* argv[])
 		return 1;
 	}
 
+	if (strstr(devpath,"akida") != NULL)
+		test_area = 0x20400000;
+	else if (strstr(devpath,"akd1500") != NULL)
+		test_area = 0x20000000;
+	else {
+		fprintf(stderr,"open(%s) failed not an akida driver\n", devpath);
+		return 1;
+	}
+
 	failed = 0;
 
 	test = tab_test;
 	do {
 		printf("-- %s\n", test->name);
-		err = test->tst_fct(fd, 1, devpath, 0x20400000);
+		err = test->tst_fct(fd, 1, devpath, test_area);
 		printf("-- %s %s\n", test->name, err ? "FAILED" : "ok");
 		if (err)
 			failed++;
