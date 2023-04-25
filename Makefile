@@ -43,8 +43,9 @@ endif
 
 obj-m := akida-pcie.o
 
-akida-pcie-y += akida-pcie-core.o
+akida-pcie-y += akida-pcie-core.o akida-pcie-hdma.o
 CFLAGS_akida-pcie-core.o += -I$(src)/akida-dw-edma
+CFLAGS_akida-pcie-hdma.o += -I$(src)/akida-dw-edma
 
 ifneq ($(CFG_AKIDA_DMA_RAM_PHY_FILE),)
 # makefile for AKIDA_DMA_RAM_PHY_* variable provided.

@@ -5,6 +5,7 @@
  *
  * Author: Herve Codina <herve.codina@bootlin.com>
  */
+#define DEBUG
 #include <linux/delay.h>
 #include <linux/dmaengine.h>
 #include <linux/dma/edma.h>
@@ -24,6 +25,7 @@
 
 #include "dw-edma-core.h"
 #include "akida-edma.h"
+#include "akida-pcie-hdma.h"
 
 static DEFINE_IDA(akida_devno);
 
@@ -62,34 +64,8 @@ static DEFINE_IDA(akida_devno);
 #define AKIDA_DMA_RAM_PHY_DT_OFFSET(t,i) AKIDA_DMA_RAM_PHY_##t##i##_DT_OFFSET
 #define AKIDA_DMA_RAM_PHY_DT_SIZE(t,i)   AKIDA_DMA_RAM_PHY_##t##i##_DT_SIZE
 
-/* Maximum DMA transfer chunk size */
-#define AKIDA_DMA_XFER_MAX_SIZE  1024
-
 #define AKIDA_1500_BAR2_OFFSET 0xFCC00000
 #define AKIDA_1500_BAR4_OFFSET 0x20000000
-
-struct akida_dma_chan {
-	struct dma_chan *chan;
-	struct completion dma_complete;
-	enum dma_transfer_direction dma_xfer_dir;
-	enum dma_data_direction dma_data_dir;
-	dma_addr_t dma_buf;
-	size_t dma_len;
-	bool is_used;
-};
-
-struct akida_dev {
-	struct pci_dev *pdev;
-	int devno;
-	struct miscdevice miscdev;
-	struct dw_edma_chip edma_chip;
-	struct dw_edma dw;
-	struct akida_dma_chan rxchan[2];
-	struct akida_dma_chan txchan[2];
-	wait_queue_head_t wq_rxchan;
-	wait_queue_head_t wq_txchan;
-	void __iomem *mmio_bar0;
-};
 
 enum {
 	AKIDA_1000 = 0,
@@ -216,15 +192,16 @@ static bool akida_is_allowed(phys_addr_t addr, size_t size)
 		addr >= (AKIDA_DMA_RAM_PHY_ADDR + AKIDA_DMA_RAM_PHY_SIZE);
 }
 
-static struct akida_dma_chan *akida_get_unsused_chan(
+static struct akida_dma_chan *akida_get_unused_chan(
 					struct akida_dma_chan *tab_chan,
 					unsigned int nb_chan)
 {
 	unsigned int i;
 
 	for (i = 0; i < nb_chan; i++) {
-		if (!(tab_chan+i)->is_used)
+		if (!(tab_chan+i)->is_used){
 			return tab_chan+i;
+		}
 	}
 	return NULL;
 }
@@ -239,7 +216,7 @@ static struct akida_dma_chan *akida_acquire_chan(wait_queue_head_t *wq,
 	spin_lock(&wq->lock);
 
 	ret = wait_event_interruptible_locked(*wq,
-		(chan = akida_get_unsused_chan(tab_chan, nb_chan)));
+		(chan = akida_get_unused_chan(tab_chan, nb_chan)));
 	if (ret) {
 		spin_unlock(&wq->lock);
 		return ERR_PTR(ret);
@@ -260,24 +237,24 @@ static void akida_release_chan(wait_queue_head_t *wq, struct akida_dma_chan *cha
 	spin_unlock(&wq->lock);
 }
 
-static inline struct akida_dma_chan *akida_acquire_rxchan(struct akida_dev *akida)
+inline struct akida_dma_chan *akida_acquire_rxchan(struct akida_dev *akida)
 {
 	return akida_acquire_chan(&akida->wq_rxchan, akida->rxchan,
 				  ARRAY_SIZE(akida->rxchan));
 }
 
-static inline void akida_release_rxchan(struct akida_dev *akida, struct akida_dma_chan *rxchan)
+inline void akida_release_rxchan(struct akida_dev *akida, struct akida_dma_chan *rxchan)
 {
 	akida_release_chan(&akida->wq_rxchan, rxchan);
 }
 
-static inline struct akida_dma_chan *akida_acquire_txchan(struct akida_dev *akida)
+inline struct akida_dma_chan *akida_acquire_txchan(struct akida_dev *akida)
 {
 	return akida_acquire_chan(&akida->wq_txchan, akida->txchan,
 				  ARRAY_SIZE(akida->txchan));
 }
 
-static inline void akida_release_txchan(struct akida_dev *akida, struct akida_dma_chan *txchan)
+inline void akida_release_txchan(struct akida_dev *akida, struct akida_dma_chan *txchan)
 {
 	akida_release_chan(&akida->wq_txchan, txchan);
 }
@@ -473,6 +450,9 @@ static const struct file_operations akida_1000_fops = {
 static const struct file_operations akida_1500_fops = {
 	.owner = THIS_MODULE,
 	.mmap = akida_1500_mmap,
+	.write = akida_1500_skel_write,
+	.read = akida_1500_skel_read,
+	.llseek = no_seek_end_llseek,
 };
 
 struct akida_iatu_conf {
@@ -1001,10 +981,12 @@ static int akida_1500_probe(struct pci_dev *pdev)
 		return ret;
 	}
 
+	pci_set_master(pdev);
+
 	/* Mapping PCI BAR regions:
 	 *  - BAR0: IATU regs and eDMA regs
 	 */
-	ret = pcim_iomap_regions(pdev, BIT(BAR_0), pci_name(pdev));
+	ret = pcim_iomap_regions(pdev, BIT(BAR_0) | BIT(BAR_2), pci_name(pdev));
 	if (ret) {
 		pci_err(pdev, "BAR I/O remapping failed (%d)\n", ret);
 		return ret;
@@ -1018,19 +1000,62 @@ static int akida_1500_probe(struct pci_dev *pdev)
 		return ret;
 	}
 
-	pci_set_master(pdev);
+	/* DMA configuration */
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 17, 0)
+	ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(64));
+#else
+	ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+#endif
+	if (ret) {
+		pci_warn(pdev, "DMA mask 64 set failed\n");
+
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(5, 17, 0)
+		ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
+#else
+		ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(32));
+#endif
+		if (ret) {
+			pci_err(pdev, "DMA mask 32 set failed (%d)\n", ret);
+			return ret;
+		}
+	}
+
+	/* IRQs allocation */
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_MSIX);
+	if (ret < 1) {
+		pci_err(pdev, "fail to alloc IRQ vector (%d)\n",
+			ret);
+		return -EPERM;
+	}
+
+	/* Checked if PCI interrupts were enabled */
+	if (!pci_dev_msi_enabled(pdev)) {
+		pci_err(pdev, "enable interrupt failed\n");
+		ret = -EPERM;
+		goto fail_free_irq_vectors;
+	}
+
+	/* Init waitqueues */
+	init_waitqueue_head(&akida->wq_rxchan);
+	init_waitqueue_head(&akida->wq_txchan);
+
+	akida_hdma_init(akida);
+
+	ret = akida_hdma_irq_init(akida);
+	if (ret)
+		goto fail_free_irq_vectors;
 
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(4, 19, 0)
 	ret = ida_simple_get(&akida_devno, 0, 0, GFP_KERNEL);
 	if (ret < 0) {
 		pci_err(pdev, "ida simple get failed (%d)\n", ret);
-		return ret;
+		goto fail_free_irq;
 	}
 #else
 	ret = ida_alloc(&akida_devno, GFP_KERNEL);
 	if (ret < 0) {
 		pci_err(pdev, "ida alloc failed (%d)\n", ret);
-		return ret;
+		goto fail_free_irq;
 	}
 #endif
 	akida->devno = ret;
@@ -1060,6 +1085,10 @@ fail_ida_alloc:
 #else
 	ida_free(&akida_devno, akida->devno);
 #endif
+fail_free_irq:
+	akida_hdma_irq_off(akida);
+fail_free_irq_vectors:
+	pci_free_irq_vectors(pdev);
 	return ret;
 }
 
@@ -1089,13 +1118,17 @@ static void akida_remove(struct pci_dev *pdev)
 #endif
 	if (akida->txchan[0].chan && akida->rxchan[0].chan)
 		akida_dma_exit(akida);
+
 	if (akida->edma_chip.dev) {
 		ret = akida_dw_edma_remove(&akida->edma_chip);
 		if (ret)
 			pci_warn(pdev, "can't remove device properly (%d)\n", ret);
-	}
-	if (pci_dev_msi_enabled(pdev))
+	} else
+		akida_hdma_irq_off(akida);
+
+	if (pci_dev_msi_enabled(pdev)) {
 		pci_free_irq_vectors(pdev);
+	}
 
 	if (akida->mmio_bar0)
 		pcim_iounmap_regions(pdev, BIT(BAR_0));
